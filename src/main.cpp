@@ -2,6 +2,8 @@
 #include <fstream>
 #include <iostream>
 #include <cmath>
+#include <ctime>
+#include <algorithm>
 
 #include <xatlas/xatlas.h>
 #include <embree3/rtcore.h>
@@ -11,7 +13,7 @@
 #include "system.h"
 #include "embree.h"
 #include "oidn.h"
-#include <lm.h>
+#include "lm.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -20,7 +22,8 @@ struct Vertex
 {
 	float X, Y, Z;
 	float NormalX, NormalY, NormalZ;
-	float U, V;
+	float U1, V1;
+	float U2, V2;
 };
 
 static void embreeError(void* /*userPtr*/, enum RTCError /*code*/, const char* str)
@@ -60,7 +63,8 @@ void saveImage(const char* filename, int width, int height, const std::vector<fl
 
 std::vector<uint32_t> generateIndicesFromVertices(const std::vector<Vertex>& vertices)
 {
-	std::vector<uint32_t> indices(vertices.size());
+	std::vector<uint32_t> indices;
+	indices.reserve(vertices.size());
 	for (uint32_t i = 0; i < vertices.size(); ++i)
 	{
 		indices.push_back(i);
@@ -73,7 +77,8 @@ static float halton(int index, int base)
 {
 	float result = 0;
 	float f = 1;
-	while (index > 0) {
+	while (index > 0)
+	{
 		f /= base;
 		result += f * (index % base);
 		index = (int)floor(index / (float)base);
@@ -84,16 +89,6 @@ static float halton(int index, int base)
 inline float fract(float a)
 {
 	return a - trunc(a);
-}
-
-inline float max(float a, float b)
-{
-	return (a < b) ? b : a;
-}
-
-inline float min(float a, float b)
-{
-	return (a < b) ? a : b;
 }
 
 inline float frand()
@@ -126,137 +121,318 @@ static glm::vec3 randomDirHemisphere(int index, const float* offset, const glm::
 	return dir;
 }
 
-// https://github.com/aras-p/ToyPathTracer
-static void traceRays(uint32_t start, uint32_t end, const std::vector<Vertex>& vertices)
+struct TexelData
 {
-	const float kNear = 0.01f * modelGetScale();
-	// Initialize paths.
-	for (uint32_t i = start; i < end; i++) 
+	glm::vec3 accumColor;
+	uint32_t numColorSamples;
+	int numPathsTraced; // Seed for randomDirHemisphere.
+	float randomOffset[2];
+};
+
+struct SampleLocation
+{
+	glm::vec3 pos;
+	glm::vec3 normal;
+	uint32_t uv[2];
+};
+
+static std::vector<uint32_t> sortSamples(const std::vector<SampleLocation>& sampleLocations, int width, int height)
+{
+	std::vector<uint32_t> sampleLocationRanks(sampleLocations.size());
+	for (uint32_t i = 0; i < sampleLocationRanks.size(); ++i)
 	{
-		TexelData& texel = s_bake.texels[i];
-		const SampleLocation& sample = s_bake.sampleLocations[s_bake.sampleLocationRanks[i]];
-		glm::vec3 color (0.0f);
-		glm::vec3 throughput (1.0f);
-		glm::vec3 rayOrigin = sample.pos;
-		glm::vec3 rayDir = randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal);
-		for (int depth = 0; depth < s_bake.options.maxDepth; depth++) 
-		{
-			RTCIntersectContext context;
-			rtcInitIntersectContext(&context);
-			alignas(16) RTCRayHit rh;
-			rh.ray.org_x = rayOrigin.x;
-			rh.ray.org_y = rayOrigin.y;
-			rh.ray.org_z = rayOrigin.z;
-			rh.ray.tnear = kNear;
-			rh.ray.dir_x = rayDir.x;
-			rh.ray.dir_y = rayDir.y;
-			rh.ray.dir_z = rayDir.z;
-			rh.ray.time = 0.0f;
-			rh.ray.tfar = FLT_MAX;
-			rh.ray.mask = UINT32_MAX;
-			rh.ray.id = 0;
-			rh.ray.flags = 0;
-			rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
-			rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-			embree::Intersect1(s_bake.embreeScene, &context, &rh);
-			s_bake.numRaysTraced++;
-			texel.numPathsTraced++;
-			if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) 
-			{
-				// Ray missed, use sky color.
-				color = color + (throughput * s_bake.options.skyColor);
-				break;
-			}
-			const Vertex& v0 = vertices[rh.hit.primID * 3 + 0];
-			const Vertex& v1 = vertices[rh.hit.primID * 3 + 1];
-			const Vertex& v2 = vertices[rh.hit.primID * 3 + 2];
+		sampleLocationRanks[i] = i;
+	}
+	auto compareSampleLocations = [sampleLocations, width, height](const uint32_t& i0, const uint32_t& i1)
+	{
+		const uint32_t offset0 = sampleLocations[i0].uv[0] + sampleLocations[i0].uv[1] * width;
+		const uint32_t offset1 = sampleLocations[i1].uv[0] + sampleLocations[i1].uv[1] * width;
+		if (offset0 < offset1)
+			return -1;
+		else if (offset0 > offset1)
+			return 1;
+		return 0;
+	};
+	std::sort(sampleLocationRanks.begin(), sampleLocationRanks.end(), compareSampleLocations);
+	return sampleLocationRanks;
+}
 
-			// we got a new ray bounced from the surface; recursively trace it
-			glm::vec3 diffuse(0.5f);
-			glm::vec3 emission(0.0f);
+static void traceRays(int width, int height, const std::vector<Vertex>& vertices, std::vector<float>& lightmap, RTCScene embreeScene)
+{
+	int numTrianglesRasterized = 0;
+	std::vector<SampleLocation> sampleLocations;
 
-			//const objzMaterial* mat = s_bake.triMaterials[rh.hit.primID];
-			//if (mat) 
-			//{
-			//	diffuse = glm::vec3(mat->diffuse[0], mat->diffuse[1], mat->diffuse[2]);
-			//	emission = glm::vec3(mat->emission[0], mat->emission[1], mat->emission[2]);
-			//	float uv[2];
-			//	for (int j = 0; j < 2; j++)
-			//		uv[j] = v0.texcoord[j] + (v1.texcoord[j] - v0.texcoord[j]) * rh.hit.u + (v2.texcoord[j] - v0.texcoord[j]) * rh.hit.v;
-			//	glm::vec3 texelColor;
-			//	if (modelSampleMaterialDiffuse(mat, uv, &texelColor))
-			//	{
-			//		diffuse = diffuse * texelColor;
-			//	}
-			//	if (modelSampleMaterialEmission(mat, uv, &texelColor))
-			//	{
-			//		emission = texelColor;
-			//	}
-			//}
-
-			if (emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f)
-			{
-				color = color + (throughput * emission);
-			}
-			else
-			{
-				throughput = throughput * diffuse;
-			}
-
-			// Russian Roulette
-			// https://computergraphics.stackexchange.com/questions/2316/is-russian-roulette-really-the-answer
-			const float p = max(throughput.x, max(throughput.y, throughput.z));
-			if (frand() > p)
-			{
-				break;
-			}
-
-			throughput = throughput * (1.0f / p);
-			if (depth + 1 < kMaxDepth) 
-			{
-				// Using barycentrics should be more precise than "origin + dir * rh.ray.tfar".
-				glm::vec3 v0pos(v0.X, v0.Y, v0.Z);
-				glm::vec3 v1pos(v1.X, v1.Y, v1.Z);
-				glm::vec3 v2pos(v2.X, v2.Y, v2.Z);
-				rayOrigin = v0pos + (v1pos - v0pos) * rh.hit.u + (v2pos - v0pos) * rh.hit.v;
-				const glm::vec3 normal = glm::normalize(glm::vec3(rh.hit.Ng_x, rh.hit.Ng_y, rh.hit.Ng_z));
-				rayDir = randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, normal);
-			}
-		}
-		texel.accumColor = texel.accumColor + color;
-		texel.numColorSamples++;
+	// Don't allow duplicate samples at the same uv.
+	std::vector<bool> sampleExists(width * height);
+	for (int i = 0; i < width * height; ++i)
+	{
+		sampleExists[i] = false;
 	}
 
-	// Copy texel data to lightmap.
-	for (uint32_t i = start; i < end; i++)
+	for (uint32_t tri = 0; tri < uint32_t(vertices.size() / 3); ++tri)
 	{
-		TexelData& texel = s_bake.texels[i];
-		const SampleLocation& sample = s_bake.sampleLocations[s_bake.sampleLocationRanks[i]];
-		float* rgba = &lightmap[(sample.uv[0] + sample.uv[1] * atlas->width) * 4];
-		const float invn = 1.0f / (float)texel.numColorSamples;
-		rgba[0] = texel.accumColor.x * invn;
-		rgba[1] = texel.accumColor.y * invn;
-		rgba[2] = texel.accumColor.z * invn;
-		rgba[3] = 1.0f;
+		lm_context ctx;
+		ctx.rasterizer.x = ctx.rasterizer.y = 0;
+
+		glm::vec2 uvMin (FLT_MAX, FLT_MAX);
+		glm::vec2 uvMax (-FLT_MAX, -FLT_MAX);
+
+		for (int i = 0; i < 3; ++i) 
+		{
+			const Vertex& vertex = vertices[tri * 3 + i];
+
+			ctx.triangle.p[i] = glm::vec3(vertex.X, vertex.Y, vertex.Z);
+			ctx.triangle.uv[i].x = vertex.U2 * width;
+			ctx.triangle.uv[i].y = vertex.V2 * height;
+
+			// update bounds on lightmap
+			uvMin = glm::min(uvMin, ctx.triangle.uv[i]);
+			uvMax = glm::max(uvMax, ctx.triangle.uv[i]);
+		}
+
+		// Calculate area of interest (on lightmap) for conservative rasterization.
+		glm::vec2 bbMin = glm::floor(uvMin);
+		glm::vec2 bbMax = glm::ceil(uvMax);
+		ctx.rasterizer.minx = ctx.rasterizer.x = glm::max((int)bbMin.x - 1, 0);
+		ctx.rasterizer.miny = ctx.rasterizer.y = glm::max((int)bbMin.y - 1, 0);
+		ctx.rasterizer.maxx = glm::min((int)bbMax.x + 1, width);
+		ctx.rasterizer.maxy = glm::min((int)bbMax.y + 1, height);
+
+		assert(ctx.rasterizer.minx <= ctx.rasterizer.maxx && ctx.rasterizer.miny <= ctx.rasterizer.maxy);
+		if (lm_findFirstConservativeTriangleRasterizerPosition(&ctx)) 
+		{
+			while(true)
+			{
+				SampleLocation sample;
+				sample.pos = ctx.sample.position;
+				sample.normal = ctx.sample.direction;
+				sample.uv[0] = ctx.rasterizer.x;
+				sample.uv[1] = ctx.rasterizer.y;
+
+				const uint32_t offset = sample.uv[0] + sample.uv[1] * width;
+				if (!sampleExists[offset]) 
+				{
+					sampleExists[offset] = true;
+					sampleLocations.push_back(sample);
+				}
+
+				if (!lm_findNextConservativeTriangleRasterizerPosition(&ctx))
+				{
+					break;
+				}
+			}
+		}
+	}
+
+	auto sampleLocationRanks = sortSamples(sampleLocations, width, height);
+
+	srand(time(nullptr));
+
+	std::vector<TexelData> texels(sampleLocations.size());
+	for (uint32_t i = 0; i < (uint32_t)sampleLocations.size(); i++)
+	{
+		TexelData& texel = texels[i];
+		texel.accumColor = glm::vec3(0.0f);
+		texel.numColorSamples = 0;
+		texel.numPathsTraced = 0;
+		texel.randomOffset[0] = frand();
+		texel.randomOffset[1] = frand();
+	}
+
+	int samplesPerTexelCount = 0;
+	for (int pass = 0; pass < 10; ++pass)
+	{
+		std::cout << "Pass " << pass << std::endl;
+		const float kNear = 0.01f;
+
+		for (uint32_t i = 0; i < sampleLocations.size(); i++)
+		{
+			TexelData& texel = texels[i];
+			const SampleLocation& sample = sampleLocations[sampleLocationRanks[i]];
+			glm::vec3 color(0.0f);
+			glm::vec3 throughput(1.0f);
+
+			glm::vec3 rayOrigin = sample.pos;
+			glm::vec3 rayDir = glm::normalize(randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal));
+			for (int depth = 0; depth < kMaxDepth; ++depth)
+			{
+				RTCIntersectContext context;
+				rtcInitIntersectContext(&context);
+
+				alignas(16) RTCRayHit rh;
+				rh.ray.org_x = rayOrigin.x;
+				rh.ray.org_y = rayOrigin.y;
+				rh.ray.org_z = rayOrigin.z;
+				rh.ray.tnear = kNear;
+				rh.ray.dir_x = rayDir.x;
+				rh.ray.dir_y = rayDir.y;
+				rh.ray.dir_z = rayDir.z;
+				rh.ray.time = 0.0f;
+				rh.ray.tfar = FLT_MAX;
+				rh.ray.mask = UINT32_MAX;
+				rh.ray.id = 0;
+				rh.ray.flags = 0;
+				rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+				rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+
+				embree::Intersect1(embreeScene, &context, &rh);
+
+				texel.numPathsTraced++;
+
+				if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) // Ray missed
+				{
+					static const glm::vec3 skyColor(1.f);
+					color = color + (throughput * skyColor);
+					break;
+				}
+
+				const Vertex& v0 = vertices[rh.hit.primID * 3 + 0];
+				const Vertex& v1 = vertices[rh.hit.primID * 3 + 1];
+				const Vertex& v2 = vertices[rh.hit.primID * 3 + 2];
+
+				// we got a new ray bounced from the surface; recursively trace it
+				glm::vec3 diffuse(0.5f);
+				glm::vec3 emission(0.0f);
+
+				//const objzMaterial* mat = s_bake.triMaterials[rh.hit.primID];
+				//if (mat) 
+				//{
+				//	diffuse = glm::vec3(mat->diffuse[0], mat->diffuse[1], mat->diffuse[2]);
+				//	emission = glm::vec3(mat->emission[0], mat->emission[1], mat->emission[2]);
+				//	float uv[2];
+				//	for (int j = 0; j < 2; j++)
+				//		uv[j] = v0.texcoord[j] + (v1.texcoord[j] - v0.texcoord[j]) * rh.hit.u + (v2.texcoord[j] - v0.texcoord[j]) * rh.hit.v;
+				//	glm::vec3 texelColor;
+				//	if (modelSampleMaterialDiffuse(mat, uv, &texelColor))
+				//	{
+				//		diffuse = diffuse * texelColor;
+				//	}
+				//	if (modelSampleMaterialEmission(mat, uv, &texelColor))
+				//	{
+				//		emission = texelColor;
+				//	}
+				//}
+
+				if (emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f)
+				{
+					color = color + (throughput * emission);
+				}
+				else
+				{
+					throughput = throughput * diffuse;
+				}
+
+				// Russian Roulette
+				// https://computergraphics.stackexchange.com/questions/2316/is-russian-roulette-really-the-answer
+				const float p = glm::max(throughput.x, glm::max(throughput.y, throughput.z));
+				if (frand() > p)
+				{
+					break;
+				}
+
+				throughput = throughput * (1.0f / p);
+				if (depth + 1 < kMaxDepth)
+				{
+					// Using barycentrics should be more precise than "origin + dir * rh.ray.tfar".
+					glm::vec3 v0pos(v0.X, v0.Y, v0.Z);
+					glm::vec3 v1pos(v1.X, v1.Y, v1.Z);
+					glm::vec3 v2pos(v2.X, v2.Y, v2.Z);
+					rayOrigin = v0pos + (v1pos - v0pos) * rh.hit.u + (v2pos - v0pos) * rh.hit.v;
+					const glm::vec3 normal = glm::normalize(glm::vec3(rh.hit.Ng_x, rh.hit.Ng_y, rh.hit.Ng_z));
+					rayDir = randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, normal);
+				}
+			}
+
+			texel.accumColor = texel.accumColor + color;
+			texel.numColorSamples++;
+		}
+
+		// Copy texel data to lightmap.
+		for (uint32_t i = 0; i < sampleLocations.size(); ++i)
+		{
+			TexelData& texel = texels[i];
+			const SampleLocation& sample = sampleLocations[sampleLocationRanks[i]];
+			float* rgba = &lightmap[(sample.uv[0] + sample.uv[1] * width) * 4];
+			const float invn = 1.0f / (float)texel.numColorSamples;
+			rgba[0] = texel.accumColor.x * invn;
+			rgba[1] = texel.accumColor.y * invn;
+			rgba[2] = texel.accumColor.z * invn;
+			rgba[3] = 1.0f;
+		}
+
+		samplesPerTexelCount++;
 	}
 }
 
-
-int main(int argc, char** argv)
+std::vector<float> denoise(std::vector<float>& lightmap, int width, int height)
 {
-	embree::init();
-	oidn::init();
+	std::vector<float> denoisedLightmap(lightmap.size());
 
-	if (argc < 1)
+	OIDNDevice device = oidn::NewDevice(OIDN_DEVICE_TYPE_DEFAULT);
+	if (!device)
 	{
-		fatalError("No input file");
+		fatalError("OIDN device creation failed");
 	}
 
+	oidn::SetDeviceErrorFunction(device, oidnError, nullptr);
+	oidn::SetDevice1b(device, "setAffinity", false);
+	oidn::CommitDevice(device);
+	OIDNFilter filter = oidn::NewFilter(device, "RTLightmap");
+	oidn::SetSharedFilterImage(filter, "color", &lightmap[0], OIDN_FORMAT_FLOAT3, width, height, 0, sizeof(float) * 4, 0);
+	oidn::SetSharedFilterImage(filter, "output", &denoisedLightmap[0], OIDN_FORMAT_FLOAT3, width, height, 0, sizeof(float) * 4, 0);
+	oidn::CommitFilter(filter);
+	oidn::ExecuteFilter(filter);
+	oidn::ReleaseFilter(filter);
+	oidn::ReleaseDevice(device);
+
+	for (int i = 0; i < width * height; i++)
+	{
+		denoisedLightmap[i * 4 + 3] = lightmap[i * 4 + 3];
+	}
+
+	return denoisedLightmap;
+}
+
+std::vector<Vertex> loadMesh(const char* filename)
+{
+	std::fstream file(filename, std::ios::in | std::ios::binary);
+	if (!file.is_open())
+	{
+		fatalError("Could not open mesh file");
+	}
+
+	int32_t verticesCount; 
+	file.read((char*)&verticesCount, sizeof(int32_t));
+
 	std::vector<Vertex> vertices;
-	// TODO: load mesh
+	vertices.reserve(verticesCount);
+	for (int i = 0; i < verticesCount; ++i)
+	{
+		Vertex v;
+		file.read((char*)&v, sizeof(Vertex));
+		vertices.push_back(v);
+	}
+	file.close();
+	return vertices;
+}
 
-	std::vector<uint32_t> indices = generateIndicesFromVertices(vertices);
+void saveMesh(const char* filename, const std::vector<Vertex>& vertices)
+{
+	std::fstream file(filename, std::ios::out | std::ios::binary);
 
+	int32_t size = vertices.size();
+	file.write((char*)&size, sizeof(int32_t));
+
+	for (int i = 0; i < vertices.size(); ++i)
+	{
+		const Vertex& v = vertices[i];
+		file.write((char*)&v, sizeof(Vertex));
+	}
+	file.close();
+}
+
+xatlas::Atlas* generateUVs(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+{
 	xatlas::Atlas* atlas = xatlas::Create();
 
 	xatlas::MeshDecl meshDecl;
@@ -265,7 +441,7 @@ int main(int argc, char** argv)
 	meshDecl.vertexPositionStride = sizeof(Vertex);
 	meshDecl.vertexNormalData = &vertices[0].NormalX;
 	meshDecl.vertexNormalStride = sizeof(Vertex);
-	meshDecl.vertexUvData = &vertices[0].U;
+	meshDecl.vertexUvData = &vertices[0].U1;
 	meshDecl.vertexUvStride = sizeof(Vertex);
 	meshDecl.indexCount = vertices.size();
 	meshDecl.indexData = &indices[0];
@@ -283,23 +459,22 @@ int main(int argc, char** argv)
 	xatlas::PackOptions packOptions;
 	xatlas::PackCharts(atlas, packOptions);
 
+	for (uint32_t i = 0; i < atlas->meshCount; i++)
 	{
-		std::fstream file("output.txt");
-		for (uint32_t i = 0; i < atlas->meshCount; i++)
+		const xatlas::Mesh& outputMesh = atlas->meshes[i];
+		for (uint32_t j = 0; j < outputMesh.indexCount; ++j)
 		{
-			const xatlas::Mesh& outputMesh = atlas->meshes[i];
-			for (uint32_t j = 0; j < outputMesh.indexCount; ++j)
-			{
-				const xatlas::Vertex& vertex = outputMesh.vertexArray[outputMesh.indexArray[j]];
-				float u = vertex.uv[0] / (float)atlas->width;
-				float v = vertex.uv[1] / (float)atlas->height;
-				file << u << v << std::endl;
-			}
+			const xatlas::Vertex& vertex = outputMesh.vertexArray[outputMesh.indexArray[j]];
+			vertices[j].U2 = vertex.uv[0] / (float)atlas->width;
+			vertices[j].V2 = vertex.uv[1] / (float)atlas->height;
 		}
 	}
 
-	std::vector<float> lightmap(atlas->width * atlas->height * 4);
+	return atlas;
+}
 
+std::vector<float> traceLightmap(xatlas::Atlas* atlas, std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+{
 	RTCDevice embreeDevice = embree::NewDevice(nullptr);
 	if (!embreeDevice)
 	{
@@ -317,37 +492,38 @@ int main(int argc, char** argv)
 	embree::AttachGeometry(embreeScene, embreeGeometry);
 	embree::CommitScene(embreeScene);
 
-	embree::ReleaseScene(embreeScene);
-	embree::ReleaseGeometry(embreeGeometry);
-	embree::ReleaseDevice(embreeDevice);
+	std::vector<float> lightmap(atlas->width * atlas->height * 4);
+	traceRays(atlas->width, atlas->height, vertices, lightmap, embreeScene);
+	return lightmap;
+}
 
-	std::vector<float> denoisedLightmap(atlas->width * atlas->height * 4);
+int main(int argc, char** argv)
+{
+	embree::init();
+	oidn::init();
 
-	OIDNDevice device = oidn::NewDevice(OIDN_DEVICE_TYPE_DEFAULT);
-	if(!device)
+	if (argc < 2)
 	{
-		fatalError("OIDN device creation failed");
+		fatalError("No input file");
 	}
+	std::cout << "Loading mesh " << argv[1] << std::endl;
+	std::vector<Vertex> vertices = loadMesh(argv[1]);
+	std::vector<uint32_t> indices = generateIndicesFromVertices(vertices);
 
-	oidn::SetDeviceErrorFunction(device, oidnError, nullptr);
-	oidn::SetDevice1b(device, "setAffinity", false);
-	oidn::CommitDevice(device);
-	OIDNFilter filter = oidn::NewFilter(device, "RTLightmap");
-	oidn::SetSharedFilterImage(filter, "color", &lightmap[0], OIDN_FORMAT_FLOAT3, atlas->width, atlas->height, 0, sizeof(float) * 4, 0);
-	oidn::SetSharedFilterImage(filter, "output", &denoisedLightmap[0], OIDN_FORMAT_FLOAT3, atlas->width, atlas->height, 0, sizeof(float) * 4, 0);
-	oidn::CommitFilter(filter);
-	oidn::ExecuteFilter(filter);
-	oidn::ReleaseFilter(filter);
-	oidn::ReleaseDevice(device);
+	std::cout << "Generate UVs" << std::endl;
+	xatlas::Atlas* atlas = generateUVs(vertices, indices);
 
-	for (uint32_t i = 0; i < atlas->width * atlas->height; i++)
-	{
-		denoisedLightmap[i * 4 + 3] = lightmap[i * 4 + 3];
-	}
+	std::cout << "Trace" << std::endl;
+	std::vector<float> lightmap = traceLightmap(atlas, vertices, indices);
+
+	std::cout << "Denoise" << std::endl;
+	std::vector<float> denoisedLightmap = denoise(lightmap, atlas->width, atlas->height);
 
 	xatlas::Destroy(atlas);
 
-	saveImage("lightmap.png", atlas->width, atlas->height, lightmap);
+	std::cout << "Save" << std::endl;
+	saveMesh("mesh.bin", vertices);
+	saveImage("lightmap.png", atlas->width, atlas->height, denoisedLightmap);
 
 	return 0;
 }
@@ -366,6 +542,7 @@ void* loadLibrary(const char* filename)
 {
 	return (void*)::LoadLibraryA(filename);
 }
+
 void* loadSymbol(void* handle, const char* symbol)
 {
 	return (void*)::GetProcAddress((HMODULE)handle, symbol);
