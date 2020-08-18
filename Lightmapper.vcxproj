@@ -43,6 +43,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>deps/;deps/oidn;deps/oidn/Include;deps/embree3;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization>MaxSpeed</Optimization>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

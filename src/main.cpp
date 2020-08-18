@@ -18,6 +18,44 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
+class RngMwc
+{
+public:
+	RngMwc(uint32_t _z = 12345, uint32_t _w = 65435);
+	void reset(uint32_t _z = 12345, uint32_t _w = 65435);
+	uint32_t gen();
+
+private:
+	uint32_t m_z;
+	uint32_t m_w;
+};
+
+inline RngMwc::RngMwc(uint32_t _z, uint32_t _w)
+	: m_z(_z)
+	, m_w(_w)
+{
+}
+
+inline void RngMwc::reset(uint32_t _z, uint32_t _w)
+{
+	m_z = _z;
+	m_w = _w;
+}
+
+inline uint32_t RngMwc::gen()
+{
+	m_z = 36969 * (m_z & 65535) + (m_z >> 16);
+	m_w = 18000 * (m_w & 65535) + (m_w >> 16);
+	return (m_z << 16) + m_w;
+}
+
+template <typename Rng>
+inline float frnd(Rng* _rng)
+{
+	uint32_t rnd = _rng->gen() & UINT16_MAX;
+	return float(rnd) * 1.0f / float(UINT16_MAX);
+}
+
 struct Vertex
 {
 	float X, Y, Z;
@@ -91,14 +129,9 @@ inline float fract(float a)
 	return a - trunc(a);
 }
 
-inline float frand()
-{
-	uint32_t rnd = rand() & UINT16_MAX;
-	return float(rnd) * 1.0f / float(UINT16_MAX);
-}
-
 constexpr float kPi2 = 6.2831853071795864769252867665590f;
 constexpr int kMaxDepth = 8;
+constexpr int kPassCount = 100;
 
 // Precomputed Global Illumination in Frostbite (GDC 2018)
 static glm::vec3 randomDirHemisphere(int index, const float* offset, const glm::vec3& normal)
@@ -228,6 +261,9 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 
 	srand(time(nullptr));
 
+	RngMwc rng;
+	rng.reset();
+
 	std::vector<TexelData> texels(sampleLocations.size());
 	for (uint32_t i = 0; i < (uint32_t)sampleLocations.size(); i++)
 	{
@@ -235,14 +271,18 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 		texel.accumColor = glm::vec3(0.0f);
 		texel.numColorSamples = 0;
 		texel.numPathsTraced = 0;
-		texel.randomOffset[0] = frand();
-		texel.randomOffset[1] = frand();
+		texel.randomOffset[0] = frnd(&rng);
+		texel.randomOffset[1] = frnd(&rng);
 	}
 
 	int samplesPerTexelCount = 0;
-	for (int pass = 0; pass < 10; ++pass)
+	for (int pass = 0; pass < kPassCount; ++pass)
 	{
-		std::cout << "Pass " << pass << std::endl;
+		if (pass % 10 == 0)
+		{
+			std::cout << "Pass " << pass << std::endl;
+		}
+		
 		const float kNear = 0.01f;
 
 		for (uint32_t i = 0; i < sampleLocations.size(); i++)
@@ -253,7 +293,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 			glm::vec3 throughput(1.0f);
 
 			glm::vec3 rayOrigin = sample.pos;
-			glm::vec3 rayDir = glm::normalize(randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal));
+			glm::vec3 rayDir = randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal);
 			for (int depth = 0; depth < kMaxDepth; ++depth)
 			{
 				RTCIntersectContext context;
@@ -325,7 +365,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 				// Russian Roulette
 				// https://computergraphics.stackexchange.com/questions/2316/is-russian-roulette-really-the-answer
 				const float p = glm::max(throughput.x, glm::max(throughput.y, throughput.z));
-				if (frand() > p)
+				if (frnd(&rng) > p)
 				{
 					break;
 				}
@@ -347,20 +387,20 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 			texel.numColorSamples++;
 		}
 
-		// Copy texel data to lightmap.
-		for (uint32_t i = 0; i < sampleLocations.size(); ++i)
-		{
-			TexelData& texel = texels[i];
-			const SampleLocation& sample = sampleLocations[sampleLocationRanks[i]];
-			float* rgba = &lightmap[(sample.uv[0] + sample.uv[1] * width) * 4];
-			const float invn = 1.0f / (float)texel.numColorSamples;
-			rgba[0] = texel.accumColor.x * invn;
-			rgba[1] = texel.accumColor.y * invn;
-			rgba[2] = texel.accumColor.z * invn;
-			rgba[3] = 1.0f;
-		}
-
 		samplesPerTexelCount++;
+	}
+
+	// Copy texel data to lightmap.
+	for (uint32_t i = 0; i < sampleLocations.size(); ++i)
+	{
+		TexelData& texel = texels[i];
+		const SampleLocation& sample = sampleLocations[sampleLocationRanks[i]];
+		float* rgba = &lightmap[(sample.uv[0] + sample.uv[1] * width) * 4];
+		const float invn = 1.0f / (float)texel.numColorSamples;
+		rgba[0] = texel.accumColor.x * invn;
+		rgba[1] = texel.accumColor.y * invn;
+		rgba[2] = texel.accumColor.z * invn;
+		rgba[3] = 1.0f;
 	}
 }
 
@@ -506,8 +546,9 @@ int main(int argc, char** argv)
 	{
 		fatalError("No input file");
 	}
-	std::cout << "Loading mesh " << argv[1] << std::endl;
-	std::vector<Vertex> vertices = loadMesh(argv[1]);
+	const char* meshFilename = argv[1];
+	std::cout << "Loading mesh " << meshFilename << std::endl;
+	std::vector<Vertex> vertices = loadMesh(meshFilename);
 	std::vector<uint32_t> indices = generateIndicesFromVertices(vertices);
 
 	std::cout << "Generate UVs" << std::endl;
@@ -522,7 +563,8 @@ int main(int argc, char** argv)
 	xatlas::Destroy(atlas);
 
 	std::cout << "Save" << std::endl;
-	saveMesh("mesh.bin", vertices);
+	saveMesh(meshFilename, vertices);
+	saveImage("noisy.png", atlas->width, atlas->height, lightmap);
 	saveImage("lightmap.png", atlas->width, atlas->height, denoisedLightmap);
 
 	return 0;
