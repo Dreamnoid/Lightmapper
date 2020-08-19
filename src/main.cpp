@@ -4,6 +4,7 @@
 #include <cmath>
 #include <ctime>
 #include <algorithm>
+#include <string>
 
 #include <xatlas/xatlas.h>
 #include <embree3/rtcore.h>
@@ -132,6 +133,7 @@ inline float fract(float a)
 constexpr float kPi2 = 6.2831853071795864769252867665590f;
 constexpr int kMaxDepth = 8;
 constexpr int kPassCount = 100;
+constexpr float kNear = 0.01f;
 
 // Precomputed Global Illumination in Frostbite (GDC 2018)
 static glm::vec3 randomDirHemisphere(int index, const float* offset, const glm::vec3& normal)
@@ -259,8 +261,6 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 
 	auto sampleLocationRanks = sortSamples(sampleLocations, width, height);
 
-	srand(time(nullptr));
-
 	RngMwc rng;
 	rng.reset();
 
@@ -283,8 +283,6 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 			std::cout << "Pass " << pass << std::endl;
 		}
 		
-		const float kNear = 0.01f;
-
 		for (uint32_t i = 0; i < sampleLocations.size(); i++)
 		{
 			TexelData& texel = texels[i];
@@ -293,7 +291,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 			glm::vec3 throughput(1.0f);
 
 			glm::vec3 rayOrigin = sample.pos;
-			glm::vec3 rayDir = randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal);
+			glm::vec3 rayDir = glm::normalize(randomDirHemisphere(texel.numPathsTraced, texel.randomOffset, sample.normal));
 			for (int depth = 0; depth < kMaxDepth; ++depth)
 			{
 				RTCIntersectContext context;
@@ -393,13 +391,41 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 	// Copy texel data to lightmap.
 	for (uint32_t i = 0; i < sampleLocations.size(); ++i)
 	{
-		TexelData& texel = texels[i];
 		const SampleLocation& sample = sampleLocations[sampleLocationRanks[i]];
+
+		float intensity = 1.f;
+		{
+			const static glm::vec3 sunPosition = glm::vec3(1000.f, 1000.f, 1000.f);
+			glm::vec3 dirToSun = glm::normalize(sunPosition - sample.pos);
+
+			RTCIntersectContext context;
+			rtcInitIntersectContext(&context);
+
+			RTCRay ray;
+			ray.org_x = sample.pos.x;
+			ray.org_y = sample.pos.y;
+			ray.org_z = sample.pos.z;
+			ray.tnear = kNear;
+			ray.dir_x = dirToSun.x;
+			ray.dir_y = dirToSun.y;
+			ray.dir_z = dirToSun.z;
+			ray.tfar = FLT_MAX;
+			ray.mask = UINT32_MAX;
+			ray.id = 0;
+			ray.flags = 0;
+			embree::Occluded1(embreeScene, &context, &ray);
+			if (ray.tfar != FLT_MAX)
+			{
+				intensity = 0.5f;
+			}
+		}
+
+		TexelData& texel = texels[i];
 		float* rgba = &lightmap[(sample.uv[0] + sample.uv[1] * width) * 4];
 		const float invn = 1.0f / (float)texel.numColorSamples;
-		rgba[0] = texel.accumColor.x * invn;
-		rgba[1] = texel.accumColor.y * invn;
-		rgba[2] = texel.accumColor.z * invn;
+		rgba[0] = texel.accumColor.x * invn * intensity;
+		rgba[1] = texel.accumColor.y * invn * intensity;
+		rgba[2] = texel.accumColor.z * invn * intensity;
 		rgba[3] = 1.0f;
 	}
 }
@@ -546,9 +572,9 @@ int main(int argc, char** argv)
 	{
 		fatalError("No input file");
 	}
-	const char* meshFilename = argv[1];
+	std::string meshFilename(argv[1]);
 	std::cout << "Loading mesh " << meshFilename << std::endl;
-	std::vector<Vertex> vertices = loadMesh(meshFilename);
+	std::vector<Vertex> vertices = loadMesh(meshFilename.c_str());
 	std::vector<uint32_t> indices = generateIndicesFromVertices(vertices);
 
 	std::cout << "Generate UVs" << std::endl;
@@ -563,9 +589,9 @@ int main(int argc, char** argv)
 	xatlas::Destroy(atlas);
 
 	std::cout << "Save" << std::endl;
-	saveMesh(meshFilename, vertices);
-	saveImage("noisy.png", atlas->width, atlas->height, lightmap);
-	saveImage("lightmap.png", atlas->width, atlas->height, denoisedLightmap);
+	std::string lightmapFilename = meshFilename + ".png";
+	saveMesh(meshFilename.c_str(), vertices);
+	saveImage(lightmapFilename.c_str(), atlas->width, atlas->height, denoisedLightmap);
 
 	return 0;
 }
