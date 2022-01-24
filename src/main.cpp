@@ -1,6 +1,7 @@
 #include <vector>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
 #include <cmath>
 #include <ctime>
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include "embree.h"
 #include "oidn.h"
 #include "lm.h"
+#include "smesh.h"
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
@@ -57,14 +59,6 @@ inline float frnd(Rng* _rng)
 	return float(rnd) * 1.0f / float(UINT16_MAX);
 }
 
-struct Vertex
-{
-	float X, Y, Z;
-	float NormalX, NormalY, NormalZ;
-	float U1, V1;
-	float U2, V2;
-};
-
 static void embreeError(void* /*userPtr*/, enum RTCError /*code*/, const char* str)
 {
 	fatalError(str);
@@ -98,17 +92,6 @@ void saveImage(const char* filename, int width, int height, const std::vector<fl
 	}
 	stbi_write_png(filename, width, height, 4, buffer, width * 4);
 	free(buffer);
-}
-
-std::vector<uint32_t> generateIndicesFromVertices(const std::vector<Vertex>& vertices)
-{
-	std::vector<uint32_t> indices;
-	indices.reserve(vertices.size());
-	for (uint32_t i = 0; i < vertices.size(); ++i)
-	{
-		indices.push_back(i);
-	}
-	return indices;
 }
 
 // https://en.wikipedia.org/wiki/Halton_sequence
@@ -192,7 +175,7 @@ static std::vector<uint32_t> sortSamples(const std::vector<SampleLocation>& samp
 	return sampleLocationRanks;
 }
 
-static void traceRays(int width, int height, const std::vector<Vertex>& vertices, std::vector<float>& lightmap, RTCScene embreeScene)
+static void traceRays(int width, int height, const std::vector<SMESH::Vertex>& vertices, std::vector<float>& lightmap, RTCScene embreeScene)
 {
 	int numTrianglesRasterized = 0;
 	std::vector<SampleLocation> sampleLocations;
@@ -214,7 +197,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 
 		for (int i = 0; i < 3; ++i) 
 		{
-			const Vertex& vertex = vertices[tri * 3 + i];
+			const SMESH::Vertex& vertex = vertices[tri * 3 + i];
 
 			ctx.triangle.p[i] = glm::vec3(vertex.X, vertex.Y, vertex.Z);
 			ctx.triangle.uv[i].x = vertex.U2 * width;
@@ -324,9 +307,9 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 					break;
 				}
 
-				const Vertex& v0 = vertices[rh.hit.primID * 3 + 0];
-				const Vertex& v1 = vertices[rh.hit.primID * 3 + 1];
-				const Vertex& v2 = vertices[rh.hit.primID * 3 + 2];
+				const SMESH::Vertex& v0 = vertices[rh.hit.primID * 3 + 0];
+				const SMESH::Vertex& v1 = vertices[rh.hit.primID * 3 + 1];
+				const SMESH::Vertex& v2 = vertices[rh.hit.primID * 3 + 2];
 
 				// we got a new ray bounced from the surface; recursively trace it
 				glm::vec3 diffuse(0.5f);
@@ -353,11 +336,11 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 
 				if (emission.x > 0.0f || emission.y > 0.0f || emission.z > 0.0f)
 				{
-					color = color + (throughput * emission);
+					color += (throughput * emission);
 				}
 				else
 				{
-					throughput = throughput * diffuse;
+					throughput *= diffuse;
 				}
 
 				// Russian Roulette
@@ -368,7 +351,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 					break;
 				}
 
-				throughput = throughput * (1.0f / p);
+				throughput *= (1.0f / p);
 				if (depth + 1 < kMaxDepth)
 				{
 					// Using barycentrics should be more precise than "origin + dir * rh.ray.tfar".
@@ -381,7 +364,7 @@ static void traceRays(int width, int height, const std::vector<Vertex>& vertices
 				}
 			}
 
-			texel.accumColor = texel.accumColor + color;
+			texel.accumColor += color;
 			texel.numColorSamples++;
 		}
 
@@ -459,56 +442,18 @@ std::vector<float> denoise(std::vector<float>& lightmap, int width, int height)
 	return denoisedLightmap;
 }
 
-std::vector<Vertex> loadMesh(const char* filename)
-{
-	std::fstream file(filename, std::ios::in | std::ios::binary);
-	if (!file.is_open())
-	{
-		fatalError("Could not open mesh file");
-	}
-
-	int32_t verticesCount; 
-	file.read((char*)&verticesCount, sizeof(int32_t));
-
-	std::vector<Vertex> vertices;
-	vertices.reserve(verticesCount);
-	for (int i = 0; i < verticesCount; ++i)
-	{
-		Vertex v;
-		file.read((char*)&v, sizeof(Vertex));
-		vertices.push_back(v);
-	}
-	file.close();
-	return vertices;
-}
-
-void saveMesh(const char* filename, const std::vector<Vertex>& vertices)
-{
-	std::fstream file(filename, std::ios::out | std::ios::binary);
-
-	int32_t size = vertices.size();
-	file.write((char*)&size, sizeof(int32_t));
-
-	for (int i = 0; i < vertices.size(); ++i)
-	{
-		const Vertex& v = vertices[i];
-		file.write((char*)&v, sizeof(Vertex));
-	}
-	file.close();
-}
-
-xatlas::Atlas* generateUVs(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+xatlas::Atlas* generateUVs(std::vector<SMESH::Vertex>& vertices, const std::vector<uint32_t>& indices)
 {
 	xatlas::Atlas* atlas = xatlas::Create();
 
 	xatlas::MeshDecl meshDecl;
 	meshDecl.vertexCount = vertices.size();
 	meshDecl.vertexPositionData = &vertices[0];
-	meshDecl.vertexPositionStride = sizeof(Vertex);
+	meshDecl.vertexPositionStride = sizeof(SMESH::Vertex);
 	meshDecl.vertexNormalData = &vertices[0].NormalX;
-	meshDecl.vertexNormalStride = sizeof(Vertex);
+	meshDecl.vertexNormalStride = sizeof(SMESH::Vertex);
 	meshDecl.vertexUvData = &vertices[0].U1;
-	meshDecl.vertexUvStride = sizeof(Vertex);
+	meshDecl.vertexUvStride = sizeof(SMESH::Vertex);
 	meshDecl.indexCount = vertices.size();
 	meshDecl.indexData = &indices[0];
 	meshDecl.indexFormat = xatlas::IndexFormat::UInt32;
@@ -539,7 +484,7 @@ xatlas::Atlas* generateUVs(std::vector<Vertex>& vertices, const std::vector<uint
 	return atlas;
 }
 
-std::vector<float> traceLightmap(xatlas::Atlas* atlas, std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+std::vector<float> traceLightmap(xatlas::Atlas* atlas, std::vector<SMESH::Vertex>& vertices, const std::vector<uint32_t>& indices)
 {
 	RTCDevice embreeDevice = embree::NewDevice(nullptr);
 	if (!embreeDevice)
@@ -550,7 +495,7 @@ std::vector<float> traceLightmap(xatlas::Atlas* atlas, std::vector<Vertex>& vert
 	embree::SetDeviceErrorFunction(embreeDevice, embreeError, nullptr);
 
 	RTCGeometry embreeGeometry = embree::NewGeometry(embreeDevice, RTC_GEOMETRY_TYPE_TRIANGLE);
-	embree::SetSharedGeometryBuffer(embreeGeometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, &vertices[0], 0, sizeof(Vertex), vertices.size());
+	embree::SetSharedGeometryBuffer(embreeGeometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, &vertices[0], 0, sizeof(SMESH::Vertex), vertices.size());
 	embree::SetSharedGeometryBuffer(embreeGeometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, &indices[0], 0, sizeof(uint32_t) * 3, indices.size() / 3);
 	embree::CommitGeometry(embreeGeometry);
 
@@ -574,24 +519,44 @@ int main(int argc, char** argv)
 	}
 	std::string meshFilename(argv[1]);
 	std::cout << "Loading mesh " << meshFilename << std::endl;
-	std::vector<Vertex> vertices = loadMesh(meshFilename.c_str());
-	std::vector<uint32_t> indices = generateIndicesFromVertices(vertices);
+	SMESH::Mesh mesh = SMESH::load(meshFilename);
+
+	std::vector<SMESH::Vertex> allVertices;
+	for (const SMESH::Group& group : mesh)
+	{
+		for (const SMESH::Vertex& v : group.Vertices)
+		{
+			allVertices.push_back(v);
+		}
+	}
+
+	std::vector<uint32_t> indices = SMESH::generateIndicesFromVertices(allVertices);
 
 	std::cout << "Generate UVs" << std::endl;
-	xatlas::Atlas* atlas = generateUVs(vertices, indices);
+	std::vector<SMESH::Vertex> allVerticesCopy = allVertices; // generateUVs will slightly move vertices around
+	xatlas::Atlas* atlas = generateUVs(allVerticesCopy, indices);
 
 	std::cout << "Trace" << std::endl;
-	std::vector<float> lightmap = traceLightmap(atlas, vertices, indices);
+	std::vector<float> lightmap = traceLightmap(atlas, allVerticesCopy, indices);
 
 	std::cout << "Denoise" << std::endl;
 	std::vector<float> denoisedLightmap = denoise(lightmap, atlas->width, atlas->height);
 
 	xatlas::Destroy(atlas);
-
+	
 	std::cout << "Save" << std::endl;
 	std::string lightmapFilename = meshFilename + ".png";
-	saveMesh(meshFilename.c_str(), vertices);
 	saveImage(lightmapFilename.c_str(), atlas->width, atlas->height, denoisedLightmap);
+
+	SMESH::copyUV2ToUV(allVerticesCopy, allVertices);
+
+	SMESH::Mesh lightmappedMesh;
+	SMESH::Group group;
+	group.Name = std::filesystem::path(lightmapFilename).filename().string();
+	group.Vertices = allVertices;
+	lightmappedMesh.push_back(group);
+
+	SMESH::save(meshFilename + "_lightmap.smesh", lightmappedMesh);
 
 	return 0;
 }
